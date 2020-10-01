@@ -92,6 +92,8 @@ function _wg_shared_generate_keys {
 function wg_iface_detect {
     if sudo test -e $wg_iface_file; then
         wg_iface=$(sudo cat $wg_iface_file)
+    else
+        wg_iface=wg0
     fi
 }
 
@@ -116,21 +118,34 @@ function wg_host_stop {
 }
 
 function _wg_host_prepare {
-    if [[ ! $OSTYPE =~ "darwin"* ]]; then
-        err "\`docker-host-bridge\` does not know how to prepare host of type '$OSTYPE' for use with WireGuard."
-        exit 1
+    if which wg &>/dev/null; then
+        return
     fi
-    if ! which wireguard-go &>/dev/null; then
-        log Wireguard binary is missing.
-        if which brew &>/dev/null; then
-            run brew install wireguard-tools
-            if ! which wireguard-go &>/dev/null; then
-                err "Failed to install `wireguard-tools`. Aborting!"
-                return 1
+
+    log "WireGuard binary `wg` is missing."
+    case $OSTYPE in
+        darwin*)
+            if which brew &>/dev/null; then
+                run brew install wireguard-tools
             fi
-            return
-        fi
-        err "Wireguard is not installed, and neither is Homebrew."
+        ;;
+
+        linux-gnu) 
+            if which apt-get &>/dev/null; then      # ubuntu
+                run sudo apt-get install -y wireguard-tools
+            elif which pacman &>/dev/null; then     # arch
+                run sudo pacman -S wireguard-tools
+            fi
+        ;;
+
+        *)
+            err "WireGuard is not installed, and `docker-host-bridge` cannot install it on '$OSTYPE'."
+            exit 1
+        ;;
+    esac
+
+    if which wg &>/dev/null; then
+        err "Failed to install `wireguard-tools`. Aborting!"
         return 1
     fi
 }
@@ -159,9 +174,16 @@ function _wg_host_tunnel_create {
         # no interface
         log Creating WireGuard interface
         sudo mkdir -p /var/run/wireguard
-        run sudo env WG_TUN_NAME_FILE=$wg_iface_file wireguard-go utun
-        run sudo chmod a+r $wg_iface_file
-        wg_iface=$(sudo cat $wg_iface_file)
+
+        if [[ "$OSTYPE" == linux-gnu ]]; then
+            run sudo ip link add dev $wg_iface type wireguard
+            sudo sh -c "echo $wg_iface > $wg_iface_file"
+        else
+            run sudo env WG_TUN_NAME_FILE=$wg_iface_file wireguard-go utun
+            run sudo chmod a+r $wg_iface_file
+            wg_iface=$(sudo cat $wg_iface_file)
+        fi
+
     else
         success WireGuard interface $(value $wg_iface) already exists.
     fi
@@ -567,13 +589,12 @@ function do__sync {
 # Create configuration directory
 mkdir -p "$CONFIG_DIR"
 
-# Check if there is an existing interface configured
-if test -e $wg_iface_file; then
-    wg_iface=$(cat $wg_iface_file)
-    if ! ifconfig $wg_iface &>/dev/null; then
-        wg_iface=
-        # sudo rm $wg_iface_file
-    fi
+
+
+# Find our interface
+wg_iface_detect
+if ! sudo wg show $wg_iface &>/dev/null; then
+    wg_iface=
 fi
 
 # Load in configured networks
