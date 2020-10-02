@@ -169,15 +169,17 @@ EOF
     fi
 }
 
+function _wg_iface_exists { [[ -n "$wg_iface" ]] && sudo wg show $wg_iface &>/dev/null; }
+
 function _wg_host_tunnel_create {
-    if [[ -z "$wg_iface" ]] || ! ifconfig $wg_iface >/dev/null 2>&1; then
+    if ! _wg_iface_exists; then
         # no interface
         log Creating WireGuard interface
         sudo mkdir -p /var/run/wireguard
 
         if [[ "$OSTYPE" == linux-gnu ]]; then
             run sudo ip link add dev $wg_iface type wireguard
-            sudo sh -c "echo $wg_iface > $wg_iface_file"
+            sudo bash <<< "set +C ; echo $wg_iface > $wg_iface_file"
         else
             run sudo env WG_TUN_NAME_FILE=$wg_iface_file wireguard-go utun
             run sudo chmod a+r $wg_iface_file
@@ -189,14 +191,51 @@ function _wg_host_tunnel_create {
     fi
 }
 
-function _wg_host_tunnel_configure {
-    log Starting WireGuard interface
+function _wg_host_configure_ifconfig {
     if [[ $(ifconfig $wg_iface | grep -c -F -e UP -e "inet $wg_host") == "2" ]]; then
       success WireGuard host interface $(value $wg_iface) is already configured.
     else
       log Configuring $(value $wg_iface) interface
       run sudo wg setconf $wg_iface "$CONFIG_DIR"/wg-host.conf
       run sudo ifconfig $wg_iface $wg_host $wg_moby up
+    fi
+}
+
+function _wg_iface_configure_iproute2 {
+    run sudo ip address add $wg_host dev $wg_iface
+    run sudo ip link set $wg_iface up
+}
+
+function _wg_iface_status_iproute2 {
+    sudo ip address show dev $wg_iface
+}
+
+function _wg_iface_configure_ifconfig {
+    run sudo ifconfig $wg_iface $wg_host $wg_moby up
+}
+
+function _wg_iface_status_ifconfig {
+    sudo ifconfig $wg_iface
+}
+
+function _wg_host_tunnel_configure {
+    local tool
+    case "$OSTYPE/$(which ifconfig)" in
+        linux-gnu/)             tool=iproute2 ;;
+        linux-gnu/*ifconfig)    tool=ifconfig ;;
+        /*ifconfig)             tool=ifconfig ;;
+        *)
+            err "WireGuard cannot be configured without `ifconfig`"
+            exit 1 ;;
+    esac
+
+    log Starting WireGuard interface
+    if [[ $(_wg_iface_status_${tool} | grep -c -F -e UP -e "inet $wg_host") == "2" ]]; then
+      success WireGuard host interface $(value $wg_iface) is already configured.
+    else
+      log Configuring $(value $wg_iface) interface
+      run sudo wg setconf $wg_iface "$CONFIG_DIR"/wg-host.conf
+      _wg_iface_configure_${tool}
     fi
 }
 
@@ -498,7 +537,7 @@ while ((1)); do
     if ( [[ -z "$event" ]] && (( current_time - last_sync > 15 )) ) || [[ "$event" == RTM_DELETE:* ]]; then
         echo "EVENT" $event
         [[ -e /tmp/docker-host-bridge.lock ]] || exit
-        ifconfig $wg_iface >/dev/null 2>&1 || exit
+        _wg_iface_exists || exit
         last_sync=$(date +%s)
         /tmp/docker-host-bridge.sh _sync
     fi
@@ -566,8 +605,11 @@ function do_reset {
 
 function do_start {
     wg_host_start
-    wg_moby_start
-    daemon_start
+    
+    if [[ "$OSTYPE" != linux-gnu ]]; then
+        wg_moby_start
+        daemon_start
+    fi
 }
 
 function do_stop {
