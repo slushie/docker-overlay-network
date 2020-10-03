@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+
+set -e
+[[ -n ${DEBUG:-} ]] && set -x
+umask 055
+
+# -------- Global variable declarations
+
+# public vars, may be overridden
+if [[ "$OSTYPE" =~ 'darwin'* ]]; then
+    : ${CONFIG_DIR:=$HOME/Library/Application Support/docker-host-bridge}
+else
+    : ${CONFIG_DIR:=$HOME/.config/docker-host-bridge}
+fi
+: ${BUILD_REF:=library/alpine:3.12}
+: ${OVERWRITE:=}
+
+# Script configuration variables
+declare -r config_path=$CONFIG_DIR
+declare -a networks=  # networks configured to be attached to the docker-host-bridge
+
+# WireGuard variables
+declare -r wg_listen_port=5060
+declare -r wg_host=198.18.1.1  # macOS IP in Moby VM
+declare -r wg_moby=198.18.1.2  # Moby VM IP in Moby VM
+declare -r wg_network=198.18.1.0/24
+declare -r dkr_network=198.18.0.0/24
+declare -r dkr_vpnkit=192.168.65.2
+declare -r wg_iface_file=/var/run/wireguard/docker-host-bridge.name
+declare wg_iface=
+
+# -------- Logging
+
+function err () { echo >&2 -e "\033[1;91mERROR\033[39m: $@\033[0m"; }
+function log () { echo >&2 -e "\033[1m$@\033[0m"; }
+function value () { echo -en "\033[34m$@\033[39m"; }
+function success () { echo >&2 -e "\033[1;92mOK\033[39m: $@\033[0m"; }
+
+function dry_run () { [[ -n "${DRY_RUN:=}" ]]; }
+
+function run () {
+  log "$([[ -f /.dockerenv ]] && echo '>>' || echo ' >') \033[0m$@"
+  dry_run || "$@"
+}
+
+# -------- docker-host-bridge network selection
+
+function networks_load {
+    if [ -e "$CONFIG_DIR"/networks ]; then
+        networks=($(cat "$CONFIG_DIR"/networks | tr "\n" " "))
+    else
+        networks=()
+    fi
+}
+
+function network_add {
+    declare network=$1
+    touch "$CONFIG_DIR"/networks
+    if ! grep -Fx "$network" "$CONFIG_DIR"/networks; then
+        echo "$network" >>"$CONFIG_DIR"/networks
+    fi
+    networks_load
+}
+
+function network_remove {
+    declare network=$1
+    touch "$CONFIG_DIR"/networks
+    if grep -Fx "$network" "$CONFIG_DIR"/networks; then
+        echo "REMOVING" $network
+        grep -Fxv "$network" "$CONFIG_DIR"/networks > "$CONFIG_DIR"/networks.tmp
+        mv "$CONFIG_DIR"/networks.tmp "$CONFIG_DIR"/networks
+    fi
+    networks_load
+}
+
+# -------- Wireguard shared configuration
+
+function _wg_shared_generate_keys {
+    log Creating a WireGuard host config
+    if [[ -e "$CONFIG_DIR"/host.pub ]]; then
+        success WireGuard keys have already been generate.
+    else
+        run wg genkey > "$CONFIG_DIR"/host.key
+        run wg pubkey < "$CONFIG_DIR"/host.key > "$CONFIG_DIR"/host.pub
+        run wg genkey > "$CONFIG_DIR"/moby.key
+        run wg pubkey < "$CONFIG_DIR"/moby.key > "$CONFIG_DIR"/moby.pub
+    fi
+}
+
+# -------- Wireguard host configuration (currently only supporting macOS)
+
+function wg_iface_detect {
+    if sudo test -e $wg_iface_file; then
+        wg_iface=$(sudo cat $wg_iface_file)
+    fi
+}
+
+function wg_host_start {
+    wg_iface_detect
+
+    _wg_shared_generate_keys
+    _wg_host_prepare
+    _wg_host_generate_config
+    _wg_host_tunnel_create
+    _wg_host_tunnel_configure
+}
+
+function wg_host_stop {
+    wg_iface_detect
+    echo $wg_iface
+    if [[ -n "$wg_iface" ]]; then
+        sudo rm /var/run/wireguard/$wg_iface.sock
+        sudo rm $wg_iface_file
+        wg_iface=
+    fi
+}
+
+function _wg_host_prepare {
+    if [[ ! $OSTYPE =~ "darwin"* ]]; then
+        err "\`docker-host-bridge\` does not know how to prepare host of type '$OSTYPE' for use with WireGuard."
+        exit 1
+    fi
+    if ! which wireguard-go &>/dev/null; then
+        log Wireguard binary is missing.
+        if which brew &>/dev/null; then
+            run brew install wireguard-tools
+            if ! which wireguard-go &>/dev/null; then
+                err "Failed to install `wireguard-tools`. Aborting!"
+                return 1
+            fi
+            return
+        fi
+        err "Wireguard is not installed, and neither is Homebrew."
+        return 1
+    fi
+}
+
+function _wg_host_generate_config {
+    # Wireguard configuration for the macOS host.
+    log Creating a WireGuard host config
+    if [[ -e "$CONFIG_DIR"/wg-host.conf ]]; then
+        success WireGuard host config already exists.
+    else
+        cat > "$CONFIG_DIR"/wg-host.conf <<EOF
+[Interface]
+PrivateKey = $(cat "$CONFIG_DIR"/host.key)
+ListenPort = $wg_listen_port
+
+[Peer]
+PublicKey = $(cat "$CONFIG_DIR"/moby.pub)
+AllowedIPs = $wg_network, $dkr_network, 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+    fi
+}
+
+function _wg_host_tunnel_create {
+    if [[ -z "$wg_iface" ]] || ! ifconfig $wg_iface >/dev/null 2>&1; then
+        # no interface
+        log Creating WireGuard interface
+        sudo mkdir -p /var/run/wireguard
+        run sudo env WG_TUN_NAME_FILE=$wg_iface_file wireguard-go utun
+        run sudo chmod a+r $wg_iface_file
+        wg_iface=$(sudo cat $wg_iface_file)
+    else
+        success WireGuard interface $(value $wg_iface) already exists.
+    fi
+}
+
+function _wg_host_tunnel_configure {
+    log Starting WireGuard interface
+    if [[ $(ifconfig $wg_iface | grep -c -F -e UP -e "inet $wg_host") == "2" ]]; then
+      success WireGuard host interface $(value $wg_iface) is already configured.
+    else
+      log Configuring $(value $wg_iface) interface
+      run sudo wg setconf $wg_iface "$CONFIG_DIR"/wg-host.conf
+      run sudo ifconfig $wg_iface $wg_host $wg_moby up
+    fi
+}
+
+# -------- Wireguard configuration for Docker Moby Linux VM
+
+function wg_moby_start {
+    _wg_shared_generate_keys
+    _wg_moby_build_module
+    _wg_moby_generate_config
+    _wg_moby_tunnel_open
+}
+
+function wg_moby_stop {
+    _wg_moby_tunnel_close
+}
+
+function _wg_moby_build_module {
+    set -eu
+
+    : ${KernelVersion:=$(docker info | awk '/Kernel Version/{print $NF}')}
+    : ${KernelRef:=}
+
+    if [[ -z "${KernelRef}" || -z "${KernelVersion}" ]]; then
+        case "$(uname -s)" in
+            Linux) # sane fallback for Docker Desktop 2.3.0.x
+            KernelVersion='4.19.76-linuxkit'
+            # 2.3.0.2
+        #      KernelRef='docker/for-desktop-kernel:4.19.76-ce15f646db9b062dc947cfc0c1deab019fa63f96-amd64'
+            # 2.3.0.3
+            KernelRef='docker/for-desktop-kernel:4.19.76-83885d3b4cff391813f4262099b36a529bca2df8-amd64'
+            ;;
+            Darwin)
+            KernelVersion="$(docker info | awk '/Kernel Version/{print $NF}')"
+            KernelRef=$(
+                docker run --privileged --rm --pid host busybox nsenter -t1 -m -- cat /etc/linuxkit.yml | \
+                ruby -ryaml -e 'puts YAML.load(STDIN.read)["kernel"]["image"]'
+            )
+            ;;
+        esac
+    fi
+
+    if [ ! -e "$CONFIG_DIR/modules/$KernelVersion/wireguard.ko" ]; then
+
+        build_image=$(
+            cat <<EOF | docker build - -q --build-arg KERNEL_REF=docker/for-desktop-kernel:4.19.76-83885d3b4cff391813f4262099b36a529bca2df8-amd64 --build-arg BUILD_REF=library/alpine:3.10 --build-arg KernelVersion=4.19.76-linuxkit
+ARG KERNEL_REF
+ARG BUILD_REF
+ARG KERNEL_VERSION
+
+FROM \${KERNEL_REF} as kernel-source
+FROM \${BUILD_REF} as build
+
+# unpack kernel sources
+WORKDIR /usr/src/linuxkit
+COPY --from=kernel-source / .
+RUN tar xf kernel-dev.tar -C / && tar xf kernel.tar -C /
+
+# install build dependencies
+RUN apk add -U build-base git curl perl
+
+# build wireguard module
+WORKDIR /usr/src
+
+RUN mkdir -p /usr/src/wireguard_module \
+    && echo -e '\
+all:\n\
+\tgit clone https://git.zx2c4.com/wireguard-linux-compat\n\
+\t\$(MAKE) -C wireguard-linux-compat/src KERNELRELEASE=\$(if \$(KERNEL_VERSION),\$(KERNEL_VERSION),\$(shell uname -r))\n\
+\tcp -a wireguard-linux-compat/src/wireguard.ko .\n'\
+    >/usr/src/wireguard_module/Makefile
+
+CMD make -C wireguard_module KERNEL_VERSION=\${KERNEL_VERSION} && cp /usr/src/wireguard_module/*.ko /modules/
+EOF
+        )
+        docker run -it --rm -v "${CONFIG_DIR}/modules/$KernelVersion":/modules $build_image
+    fi
+
+}
+
+function _wg_moby_generate_config {
+    log Creating a WireGuard peer config
+    if [[ -e "$CONFIG_DIR"/wg-moby.conf ]]; then
+        success WireGuard peer config already exists.
+    else
+        cat > "$CONFIG_DIR"/wg-moby.conf <<EOF
+[Interface]
+Address = $wg_moby
+PrivateKey = $(cat "$CONFIG_DIR"/moby.key)
+ListenPort = $wg_listen_port
+
+[Peer]
+PublicKey = $(cat "$CONFIG_DIR"/host.pub)
+AllowedIPs = $wg_network
+Endpoint = $dkr_vpnkit:$wg_listen_port
+PersistentKeepalive = 25
+EOF
+    fi   
+}
+
+function _wg_moby_tunnel_open {
+    log Configuring Docker for Mac to run WireGuard
+    declare -r peer_config="$(cat "$CONFIG_DIR"/wg-moby.conf)"
+    cat <(set | awk '!/^[A-Z0-9_]+=/{print}') - <<EOF | \
+docker run --privileged -i --rm --net host --pid host \
+    -v /dev/net/tun:/dev/net/tun \
+    -v "${CONFIG_DIR}/modules/$KernelVersion":/modules \
+    -v "$CONFIG_DIR/wg-moby.conf":"/etc/wireguard/mac-bridge.conf" \
+    --entrypoint bash \
+    frolvlad/alpine-bash -
+set -e
+
+apk add -U wireguard-tools
+
+try_ping_host () { run ping -W1 -c1 $wg_host >/dev/null; }
+
+if try_ping_host; then
+  success Peer network is available.
+  exit 0
+fi
+
+if run ip -o link | grep -q mac-bridge; then
+  log Removing existing WireGuard interface.
+  run ip link del mac-bridge
+fi
+
+log Checking Docker Desktop for WireGuard support
+if ! grep -q wireguard /proc/modules; then
+  declare kernel_version="\$(uname -r)"
+  err WireGuard kernel module is not shipped by your version of Docker
+  if [[ ! -f /modules/wireguard.ko ]]; then
+    err Cannot find WireGuard module for \$kernel_version
+    exit 1
+  fi
+  insmod /modules/wireguard.ko
+  success WireGuard kernel module loaded from internal distribution
+else
+  success WireGuard kernel module is available
+fi
+
+log Bringing up WireGuard peer interface
+run wg-quick up /etc/wireguard/mac-bridge.conf
+
+# log Trying to reach host $(value $wg_host) from Docker for Mac $(value $wg_moby)
+# try_ping_host
+# success Peer network is available.
+EOF
+}
+
+function _wg_moby_tunnel_close {
+    log Closing tunnel in Moby VM
+    cat <(set | awk '!/^[A-Z0-9_]+=/{print}') - <<EOF | \
+docker run --privileged -i --rm --net host --pid host \
+    -v /dev/net/tun:/dev/net/tun \
+    -v "${CONFIG_DIR}/modules/$KernelVersion":/modules \
+    --entrypoint bash \
+    frolvlad/alpine-bash -
+set -e
+
+if run ip -o link | grep -q mac-bridge; then
+  log Removing existing WireGuard interface.
+  run ip link del mac-bridge
+fi
+EOF
+}
+
+# ------- macOS configuration
+
+function configuration_host_reset {
+    log "Overwriting all existing configuration."
+    run sudo rm -rf "$CONFIG_DIR" /var/run/wireguard /tmp/docker-host-bridge.lock
+    route get default >/dev/null || true
+}
+
+function routes_host_configure {
+    if [[ $OSTYPE =~ 'linux'* ]]; then
+        return
+    elif [[ ! $OSTYPE =~ 'darwin'* ]]; then
+        err "\`docker-host-bridge\` does not know how to configure routes for hosts of type '$OSTYPE'."
+        exit 1
+    fi
+
+    networks_load
+
+    # Add route to MacOS routing table so that it is possible to connect.
+    _macos_route_add $wg_iface $wg_host $wg_moby
+
+    for network in $networks; do
+        if route get "$network" &>/dev/null; then  # is valid IP or range
+            _macos_route_add $wg_iface $network $wg_moby
+        elif docker network inspect "$network" &>/dev/null; then
+            declare -a subnets=$(docker network inspect "$network" -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}")
+            for subnet in $subnets; do
+                _macos_route_add $wg_iface $subnet $wg_moby
+            done
+        fi
+    done
+}
+
+function hosts_host_configure {
+    networks_load
+
+    declare -a hosts=$(docker ps -q | xargs docker inspect -f '{{ .Config.Hostname }}:{{range $network, $config := .NetworkSettings.Networks}}{{$network}}:{{$config.IPAddress}}{{end}}')
+    declare hosts_entries=""
+    
+
+    for host in $hosts; do
+        declare hostname=$(cut -f1 -d: <<<$host)
+        declare network=$(cut -f2 -d: <<<$host)
+        declare ip=$(cut -f3 -d: <<<$host)
+
+        if [[ " ${networks[@]} " =~ " ${network} " ]]; then
+            echo $hostname $network $ip
+            hosts_entries="$hosts_entries\n$ip $hostname"
+        fi
+    done
+
+    declare start_marker="# >>> start: docker mac routes >>>"
+    declare end_marker="# <<< end: docker mac routes <<<"
+    declare current_hosts_config=$(sed -nE "/($start_marker)/,/($end_marker)/p" < /etc/hosts)
+
+    if [ -z "$hosts_entries" ]; then
+        declare hosts_config=""
+    else
+        declare hosts_config="$start_marker$hosts_entries\n$end_marker\n"
+    fi
+
+    if [[ "$hosts_config" == "$current_hosts_config" ]]; then
+        echo "Hosts config up to datei"
+        return 0
+    fi
+
+    if [ -z "$hosts_config" ]; then
+        sudo sed -iE "/$start_marker/,/$end_marker/d" /etc/hosts
+        return
+    fi
+
+    if grep -F "$start_marker" /etc/hosts &>/dev/null ; then
+        if [[ "$OSTYPE" == "linux-gnu" ]]; then
+            sudo sed -i "/$start_marker/,/$end_marker/c$hosts_config" /etc/hosts
+        else
+            sudo perl -i -pe "s/($start_marker).*($end_marker)/$(echo $hosts_config | sed -e 's|/|\\\/|g')/g" /etc/hosts
+        fi
+    else
+        echo -e "$hosts_config" >> /etc/hosts
+    fi
+    
+}
+
+function _macos_route_add {
+    set -eu
+
+    declare wg_iface=$1
+    declare host_or_network=$2
+    declare gateway=$3
+
+    if [[ $wg_iface != $(route get $host_or_network | awk '/interface:/{print $2}') ]]; then
+        log "Adding routes for host/network $(value $host_or_network) via $(value $gateway) on interface $(value $wg_iface)."
+        run sudo route -q -n delete -inet $host_or_network || true
+        run sudo route -q -n add -inet -interface -ifscope $wg_iface $host_or_network $gateway
+    fi
+}
+
+function configuration_host_reset {
+    log "Overwriting all existing configuration."
+    run rm -rf "$CONFIG_DIR"
+}
+
+# -------- Daemon
+
+function daemon_start {
+    if ! ( set -C ; 2>/dev/null >/tmp/docker-host-bridge.lock ); then
+        log Already monitoring route changes as PID $(</tmp/docker-host-bridge.lock)
+        exit 0
+    fi
+
+    cat <(set | awk '!/^[A-Z0-9_]+=/{print}') - <<'EOF' \
+    | sudo bash -c "cp '$0' /tmp/docker-host-bridge.sh && exec -a 'route-monitor $wg_iface' bash -" &
+set -eu
+declare pgid=$(ps -o pgid= $$ | tr -cd 0-9)
+
+log Monitoring route changes in the background as $$
+
+out () { echo "[$(date)]" "$@"; }
+
+exec &>>/tmp/docker-host-bridge.log
+trap "out goodbye; rm -f /tmp/docker-host-bridge.{sh,lock}" EXIT
+trap "trap - TERM INT; kill -- -$pgid; exit" TERM INT
+
+out started as PID $$ from PPID $PPID in PGID $pgid
+echo $$ >/tmp/docker-host-bridge.lock
+
+declare -i last_sync=$(date +%s)
+/tmp/docker-host-bridge.sh _sync
+
+while ((1)); do
+    declare event=
+    read -r -t 15 event || :
+    declare -i current_time=$(date +%s)
+    if ( [[ -z "$event" ]] && (( current_time - last_sync > 15 )) ) || [[ "$event" == RTM_DELETE:* ]]; then
+        echo "EVENT" $event
+        [[ -e /tmp/docker-host-bridge.lock ]] || exit
+        ifconfig $wg_iface >/dev/null 2>&1 || exit
+        last_sync=$(date +%s)
+        /tmp/docker-host-bridge.sh _sync
+    fi
+done < <(route -n monitor)
+EOF
+
+    disown
+}
+
+function daemon_stop {
+    sudo rm -f /tmp/docker-host-bridge.lock
+    wg_host_stop
+    wg_moby_stop
+}
+
+function check_wireguard_tunnel {
+    log Trying to reach Docker for Mac $(value $wg_moby) from host $(value $wg_host)
+    run ping -W100 -c1 $wg_moby >/dev/null
+    success Host network is available.
+
+    log Trying to reach Docker network $(value $dkr_network) from host $(value $wg_host)
+    run ping -W100 -c1 $(perl -pe 's,\d+/\d+$,1,' <<<"$dkr_network") >/dev/null
+    success Docker network is available.
+}
+
+# --------- User Actions
+
+function do_status {
+    if [ $# -gt 0 ]; then
+        print_help
+        die "Error during argument parsing, possibly an Argbash bug." 1
+    fi
+
+    # print status
+    printf "Current interface: ${iface:-None}\n"
+    printf "Daemon: "
+    if [ -e /tmp/docker-host-bridge.lock ]; then
+        printf "Up (pid: $(cat /tmp/docker-host-bridge.lock))\n"
+    else
+        echo "Down"
+    fi
+    printf "Configured networks:\n"
+    for network in $networks; do
+        printf " - $network\n"
+    done
+}
+
+function do_check {
+    if [[ ! $OSTYPE =~ "linux"* ]]; then
+        check_wireguard_tunnel
+    fi
+}
+
+function do_add {
+    network_add $1
+}
+
+function do_remove {
+    network_remove $1
+}
+
+function do_reset {
+    configuration_host_reset
+}
+
+function do_start {
+    wg_host_start
+    wg_moby_start
+    daemon_start
+}
+
+function do_stop {
+    daemon_stop
+}
+
+function do__sync {
+    if [ -z "$wg_iface" ]; then
+        wg_host_start
+        wg_moby_start
+    fi
+
+    routes_host_configure
+    hosts_host_configure
+}
+
+# --------- Runtime
+
+# Create configuration directory
+mkdir -p "$CONFIG_DIR"
+
+# Check if there is an existing interface configured
+if test -e $wg_iface_file; then
+    wg_iface=$(cat $wg_iface_file)
+    if ! ifconfig $wg_iface &>/dev/null; then
+        wg_iface=
+        # sudo rm $wg_iface_file
+    fi
+fi
+
+# Load in configured networks
+networks_load
+
+
+die()
+{
+	local _ret="${2:-1}"
+	test "${_PRINT_HELP:-no}" = yes && print_help >&2
+	echo "$1" >&2
+	exit "${_ret}"
+}
+
+# Default values
+_positionals=()
+_arg_leftovers=()
+
+print_help()
+{
+	printf '%s\n' "The general script's help msg"
+	printf 'Usage: %s <action> ... \n' "$0"
+	printf '\t%s\n' "<action>: The action to be performed. Can be one of: {status, check, add, remove, reset, start, stop}. Additional arguments are passed onto appropriate action."
+	printf '\t%s\n' "-h, --help: Shows this help message."
+}
+
+parse_commandline()
+{
+	_positionals_count=0
+	while test $# -gt 0
+	do
+		_key="$1"
+		case "$_key" in
+			-h|--help)
+				print_help
+				exit 0
+				;;
+			-h*)
+				print_help
+				exit 0
+				;;
+			*)
+				_last_positional="$1"
+				_positionals+=("$_last_positional")
+				_positionals_count=$((_positionals_count + 1))
+				;;
+		esac
+		shift
+	done
+}
+
+handle_passed_args_count()
+{
+	local _required_args_string="'action'"
+	test "${_positionals_count}" -ge 1 || _PRINT_HELP=yes die "FATAL ERROR: Not enough positional arguments - we require at least 1 (namely: $_required_args_string), but got only ${_positionals_count}." 1
+}
+
+assign_positional_args()
+{
+	local _positional_name _shift_for=$1
+	_positional_names="_arg_action "
+	_our_args=$((${#_positionals[@]} - 1))
+	for ((ii = 0; ii < _our_args; ii++))
+	do
+		_positional_names="$_positional_names _arg_leftovers[$((ii + 0))]"
+	done
+
+	shift "$_shift_for"
+	for _positional_name in ${_positional_names}
+	do
+		test $# -gt 0 || break
+		eval "$_positional_name=\${1}" || die "Error during argument parsing, possibly an Argbash bug." 1
+		shift
+	done
+}
+
+parse_commandline "$@"
+handle_passed_args_count
+assign_positional_args 1 "${_positionals[@]}"
+
+case $_arg_action in
+    "status")
+        do_status $_arg_leftovers
+        ;;
+    "check")
+        do_check $_arg_leftovers
+        ;;
+    "add")
+        do_add $_arg_leftovers
+        ;;
+    "remove")
+        do_remove $_arg_leftovers
+        ;;
+    "reset")
+        do_reset $_arg_leftovers
+        ;;
+    "start")
+        do_start $_arg_leftovers
+        ;;
+    "stop")
+        do_stop $_arg_leftovers
+        ;;
+    "_sync")
+        do__sync $_arg_leftovers
+        ;;
+    *)
+        print_help
+        ;;
+esac
