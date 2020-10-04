@@ -13,10 +13,8 @@ else
     : ${CONFIG_DIR:=$HOME/.config/docker-host-bridge}
 fi
 : ${BUILD_REF:=library/alpine:3.12}
-: ${OVERWRITE:=}
 
 # Script configuration variables
-declare -r config_path=$CONFIG_DIR
 declare -a networks=  # networks configured to be attached to the docker-host-bridge
 
 # WireGuard variables
@@ -31,10 +29,11 @@ declare wg_iface=
 
 # -------- Logging
 
-function err () { echo >&2 -e "\033[1;91mERROR\033[39m: $@\033[0m"; }
-function log () { echo >&2 -e "\033[1m$@\033[0m"; }
-function value () { echo -en "\033[34m$@\033[39m"; }
-function success () { echo >&2 -e "\033[1;92mOK\033[39m: $@\033[0m"; }
+function err { echo >&2 -e "\033[1;91mERROR\033[39m: $@\033[0m"; }
+function log { echo >&2 -e "\033[1m$@\033[0m"; }
+function value { echo -en "\033[34m$@\033[39m"; }
+function success { echo >&2 -e "\033[1;92mOK\033[39m: $@\033[0m"; }
+function dated_log { echo "[$(date)]" "$@"; }
 
 function dry_run () { [[ -n "${DRY_RUN:=}" ]]; }
 
@@ -271,7 +270,7 @@ AllowedIPs = $wg_network
 Endpoint = $dkr_vpnkit:$wg_listen_port
 PersistentKeepalive = 25
 EOF
-    fi   
+    fi
 }
 
 function _wg_moby_tunnel_open {
@@ -349,8 +348,8 @@ function configuration_host_reset {
 }
 
 function routes_host_configure {
-    if [[ $OSTYPE =~ 'linux'* ]]; then
-        return
+    if [[ $OSTYPE == 'linux'* ]]; then
+        return   # Routing is already handled by the Linux kernel.
     elif [[ ! $OSTYPE =~ 'darwin'* ]]; then
         err "\`docker-host-bridge\` does not know how to configure routes for hosts of type '$OSTYPE'."
         exit 1
@@ -376,9 +375,12 @@ function routes_host_configure {
 function hosts_host_configure {
     networks_load
 
-    declare -a hosts=$(docker ps -q | xargs docker inspect -f '{{ .Config.Hostname }}:{{range $network, $config := .NetworkSettings.Networks}}{{$network}}:{{$config.IPAddress}}{{end}}')
+    # Get all running containers in form: <hostname>:<docker network>:<ip>
+    declare -a hosts=
+    if [ -n "$(docker ps -q)" ]; then
+        hosts=$(docker ps -q | xargs docker inspect -f '{{ .Config.Hostname }}:{{range $network, $config := .NetworkSettings.Networks}}{{$network}}:{{$config.IPAddress}}{{end}}')
+    fi
     declare hosts_entries=""
-    
 
     for host in $hosts; do
         declare hostname=$(cut -f1 -d: <<<$host)
@@ -386,23 +388,21 @@ function hosts_host_configure {
         declare ip=$(cut -f3 -d: <<<$host)
 
         if [[ " ${networks[@]} " =~ " ${network} " ]]; then
-            echo $hostname $network $ip
             hosts_entries="$hosts_entries\n$ip $hostname"
         fi
     done
 
     declare start_marker="# >>> start: docker mac routes >>>"
-    declare end_marker="# <<< end: docker mac routes <<<"
-    declare current_hosts_config=$(sed -nE "/($start_marker)/,/($end_marker)/p" < /etc/hosts)
+    declare end_marker="# <<< end: docker mac routes <<<\n"
+    declare current_hosts_config="$(sed -nE "/($start_marker)/,/($end_marker)/p" < /etc/hosts)"
 
     if [ -z "$hosts_entries" ]; then
         declare hosts_config=""
     else
-        declare hosts_config="$start_marker$hosts_entries\n$end_marker\n"
+        declare hosts_config="$start_marker$hosts_entries\n$end_marker"
     fi
 
-    if [[ "$hosts_config" == "$current_hosts_config" ]]; then
-        echo "Hosts config up to datei"
+    if [[ "$(echo $hosts_config | sed -e 's/\\n//g' | tr -d '[[:space:]]')" == "$(echo $current_hosts_config | tr -d '[[:space:]]')" ]]; then
         return 0
     fi
 
@@ -420,7 +420,9 @@ function hosts_host_configure {
     else
         echo -e "$hosts_config" >> /etc/hosts
     fi
-    
+
+    dated_log "Updated docker container hostnames in /etc/hosts:"
+    echo -e $hosts_config
 }
 
 function _macos_route_add {
@@ -445,51 +447,61 @@ function configuration_host_reset {
 # -------- Daemon
 
 function daemon_start {
-    if ! ( set -C ; 2>/dev/null >/tmp/docker-host-bridge.lock ); then
-        log Already monitoring route changes as PID $(</tmp/docker-host-bridge.lock)
+    if [ -e /tmp/docker-host-bridge.lock ]; then
+        log Already monitoring route changes as PID $(cat /tmp/docker-host-bridge.lock)
         exit 0
     fi
 
-    cat <(set | awk '!/^[A-Z0-9_]+=/{print}') - <<'EOF' \
-    | sudo bash -c "cp '$0' /tmp/docker-host-bridge.sh && exec -a 'route-monitor $wg_iface' bash -" &
+    cat <(set | awk '!/^[A-Z0-9_]+=/{print}') <(echo "CONFIG_DIR='$CONFIG_DIR'") - <<'EOF' \
+    | sudo -bH bash -c "exec -a 'route-monitor $wg_iface' bash -"
 set -eu
 declare pgid=$(ps -o pgid= $$ | tr -cd 0-9)
 
-log Monitoring route changes in the background as $$
-
-out () { echo "[$(date)]" "$@"; }
-
 exec &>>/tmp/docker-host-bridge.log
-trap "out goodbye; rm -f /tmp/docker-host-bridge.{sh,lock}" EXIT
+
+trap "dated_log 'Stopping daemon (pid $$).'; if [[ -e /tmp/docker-host-bridge.lock && '\$(</tmp/docker-host-bridge.lock)' == '$$' ]]; then rm -f /tmp/docker-host-bridge.lock; fi" EXIT
 trap "trap - TERM INT; kill -- -$pgid; exit" TERM INT
 
-out started as PID $$ from PPID $PPID in PGID $pgid
+dated_log "Starting daemon (pid $$; ppid $PPID; pgid $pgid)"
 echo $$ >/tmp/docker-host-bridge.lock
+chmod 755 /tmp/docker-host-bridge.lock
 
 declare -i last_sync=$(date +%s)
-/tmp/docker-host-bridge.sh _sync
+declare -i current_time
+declare event=
+
+function rate_limited_read {
+    read "$@"
+    if [[ "$?" -ne 0 || -z "$event" ]]; then
+        sleep 15
+    fi
+}
+
+do__sync
 
 while ((1)); do
-    declare event=
-    read -r -t 15 event || :
-    declare -i current_time=$(date +%s)
-    if ( [[ -z "$event" ]] && (( current_time - last_sync > 15 )) ) || [[ "$event" == RTM_DELETE:* ]]; then
-        echo "EVENT" $event
-        [[ -e /tmp/docker-host-bridge.lock ]] || exit
+    [[ -e /tmp/docker-host-bridge.lock ]] || exit
+    [[ "$(</tmp/docker-host-bridge.lock)" == "$$" ]] || exit
+    if [[ ! $OSTYPE == "linux"* ]]; then
         ifconfig $wg_iface >/dev/null 2>&1 || exit
-        last_sync=$(date +%s)
-        /tmp/docker-host-bridge.sh _sync
     fi
-done < <(route -n monitor)
+
+    rate_limited_read -r -t 0 event
+
+    if [[ -z "$event" || "$event" == RTM_DELETE:* ]]; then
+        do__sync
+    fi
+done < <(if [[ ! $OSTYPE == "linux"* ]]; then route -n monitor; else echo; fi)
 EOF
 
-    disown
+    while [[ ! -e /tmp/docker-host-bridge.lock ]]; do
+        sleep 0.1
+    done
+    log "Daemon started on PID $(</tmp/docker-host-bridge.lock)."
 }
 
 function daemon_stop {
     sudo rm -f /tmp/docker-host-bridge.lock
-    wg_host_stop
-    wg_moby_stop
 }
 
 function check_wireguard_tunnel {
@@ -543,17 +555,28 @@ function do_reset {
 }
 
 function do_start {
-    wg_host_start
-    wg_moby_start
+    if [[ ! "$OSTYPE" == "linux"* ]]; then
+        wg_host_start
+        wg_moby_start
+    fi
     daemon_start
 }
 
 function do_stop {
     daemon_stop
+    if [[ ! "$OSTYPE" == "linux"* ]]; then
+        wg_host_stop
+        wg_moby_stop
+    fi
+}
+
+function do_restart {
+    do_stop
+    do_start
 }
 
 function do__sync {
-    if [ -z "$wg_iface" ]; then
+    if [[ ! "$OSTYPE" == "linux"* && -z "$wg_iface" ]]; then
         wg_host_start
         wg_moby_start
     fi
@@ -675,6 +698,9 @@ case $_arg_action in
         ;;
     "stop")
         do_stop $_arg_leftovers
+        ;;
+    "restart")
+        do_restart $_arg_leftovers
         ;;
     "_sync")
         do__sync $_arg_leftovers
