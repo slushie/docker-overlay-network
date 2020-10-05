@@ -25,7 +25,11 @@ declare -r wg_network=198.18.1.0/24
 declare -r dkr_network=198.18.0.0/24
 declare -r dkr_vpnkit=192.168.65.2
 declare -r wg_iface_file=/var/run/wireguard/docker-host-bridge.name
-declare wg_iface=
+
+# Runtime variables
+declare wg_iface=  # The name of the wireguard interface (for non-Linux hosts)
+declare -a _routes=  # routes to be maintained (for non_linux hosts)
+declare -a _containers=  # docker containers
 
 # -------- Logging
 
@@ -46,7 +50,7 @@ function run () {
 
 function networks_load {
     if [ -e "$CONFIG_DIR"/networks ]; then
-        networks=($(cat "$CONFIG_DIR"/networks | tr "\n" " "))
+        networks=($(<"$CONFIG_DIR"/networks))
     else
         networks=()
     fi
@@ -65,8 +69,7 @@ function network_remove {
     declare network=$1
     touch "$CONFIG_DIR"/networks
     if grep -Fx "$network" "$CONFIG_DIR"/networks; then
-        echo "REMOVING" $network
-        grep -Fxv "$network" "$CONFIG_DIR"/networks > "$CONFIG_DIR"/networks.tmp
+        grep -Fxv "$network" "$CONFIG_DIR"/networks > "$CONFIG_DIR"/networks.tmp || true
         mv "$CONFIG_DIR"/networks.tmp "$CONFIG_DIR"/networks
     fi
     networks_load
@@ -348,6 +351,7 @@ function configuration_host_reset {
 }
 
 function routes_host_configure {
+    set +u
     if [[ $OSTYPE == 'linux'* ]]; then
         return   # Routing is already handled by the Linux kernel.
     elif [[ ! $OSTYPE =~ 'darwin'* ]]; then
@@ -357,19 +361,41 @@ function routes_host_configure {
 
     networks_load
 
-    # Add route to MacOS routing table so that it is possible to connect.
-    _macos_route_add $wg_iface $wg_host $wg_moby
+    declare -a new_routes=($wg_host)
 
-    for network in $networks; do
+    # Add all routes from selected networks
+    for network in "${networks[@]}"; do
         if route get "$network" &>/dev/null; then  # is valid IP or range
-            _macos_route_add $wg_iface $network $wg_moby
+            new_routes+=($network)
         elif docker network inspect "$network" &>/dev/null; then
-            declare -a subnets=$(docker network inspect "$network" -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}")
-            for subnet in $subnets; do
-                _macos_route_add $wg_iface $subnet $wg_moby
+            declare -a subnets=($(docker network inspect "$network" -f "{{range .IPAM.Config}}{{.Subnet}}{{end}}"))
+            for subnet in "${subnets[@]}"; do
+                new_routes+=($subnet)
             done
+        else
+            log "WARNING: Skipping unrecongised network: $network ."
         fi
     done
+
+    if [ "${new_routes[*]}" = "${_routes[*]}" ]; then
+        return  # All routes are up to date.
+    fi
+
+    # Add new routes
+    for route in "${new_routes[@]}"; do
+        if [[ -n "$route" && ! " ${_routes[*]} " =~ " $route " ]]; then
+            _macos_route_add $wg_iface $route
+        fi
+    done
+
+    # Drop deleted routes
+    for route in "${_routes[@]}"; do
+        if [[ -n "$route" && ! " ${new_routes[*]} " =~ " $route " ]]; then
+            _macos_route_drop $wg_iface $route
+        fi
+    done
+
+    _routes=("${new_routes[@]}")
 }
 
 function hosts_host_configure {
@@ -378,16 +404,16 @@ function hosts_host_configure {
     # Get all running containers in form: <hostname>:<docker network>:<ip>
     declare -a hosts=
     if [ -n "$(docker ps -q)" ]; then
-        hosts=$(docker ps -q | xargs docker inspect -f '{{ .Config.Hostname }}:{{range $network, $config := .NetworkSettings.Networks}}{{$network}}:{{$config.IPAddress}}{{end}}')
+        hosts=($(docker ps -q | xargs docker inspect -f '{{ .Config.Hostname }}:{{range $network, $config := .NetworkSettings.Networks}}{{$network}}:{{$config.IPAddress}}{{end}}'))
     fi
     declare hosts_entries=""
 
-    for host in $hosts; do
+    for host in "${hosts[@]}"; do
         declare hostname=$(cut -f1 -d: <<<$host)
         declare network=$(cut -f2 -d: <<<$host)
         declare ip=$(cut -f3 -d: <<<$host)
 
-        if [[ " ${networks[@]} " =~ " ${network} " ]]; then
+        if [[ " ${networks[*]} " =~ " ${network} " ]]; then
             hosts_entries="$hosts_entries\n$ip $hostname"
         fi
     done
@@ -430,12 +456,22 @@ function _macos_route_add {
 
     declare wg_iface=$1
     declare host_or_network=$2
-    declare gateway=$3
 
     if [[ $wg_iface != $(route get $host_or_network | awk '/interface:/{print $2}') ]]; then
-        log "Adding routes for host/network $(value $host_or_network) via $(value $gateway) on interface $(value $wg_iface)."
-        run sudo route -q -n delete -inet $host_or_network || true
-        run sudo route -q -n add -inet -interface -ifscope $wg_iface $host_or_network $gateway
+        dated_log "Adding routes for host/network $(value $host_or_network) on interface $(value $wg_iface)."
+        run sudo route -q -n add -net $host_or_network -inet -interface $wg_iface
+    fi
+}
+
+function _macos_route_drop {
+    set -eu
+
+    declare wg_iface=$1
+    declare host_or_network=$2
+
+    if [[ $wg_iface != $(route get $host_or_network | awk '/interface:/{print $2}') ]]; then
+        dated_log "Dropping routes for host/network $(value $host_or_network) on interface $(value $wg_iface)."
+        run sudo route -q -n delete -net $host_or_network -inet -interface $wg_iface || true
     fi
 }
 
@@ -459,7 +495,7 @@ declare pgid=$(ps -o pgid= $$ | tr -cd 0-9)
 
 exec &>>/tmp/docker-host-bridge.log
 
-trap "dated_log 'Stopping daemon (pid $$).'; if [[ -e /tmp/docker-host-bridge.lock && '\$(</tmp/docker-host-bridge.lock)' == '$$' ]]; then rm -f /tmp/docker-host-bridge.lock; fi" EXIT
+trap "dated_log 'Stopping daemon (pid $$).'; if [[ -e /tmp/docker-host-bridge.lock && \"\$(</tmp/docker-host-bridge.lock)\" == '$$' ]]; then rm -f /tmp/docker-host-bridge.lock; else dated_log \"Warning: failed to remove lock file \`/tmp/docker-host-bridge.lock\`.\"; fi" EXIT
 trap "trap - TERM INT; kill -- -$pgid; exit" TERM INT
 
 dated_log "Starting daemon (pid $$; ppid $PPID; pgid $pgid)"
@@ -471,6 +507,7 @@ declare -i current_time
 declare event=
 
 function rate_limited_read {
+    set +e
     read "$@"
     if [[ "$?" -ne 0 || -z "$event" ]]; then
         sleep 15
@@ -531,7 +568,7 @@ function do_status {
         echo "Down"
     fi
     printf "Configured networks:\n"
-    for network in $networks; do
+    for network in "${networks[@]}"; do
         printf " - $network\n"
     done
 }
