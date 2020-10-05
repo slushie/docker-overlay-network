@@ -102,7 +102,6 @@ function wg_host_start {
 
     _wg_shared_generate_keys
     _wg_host_prepare
-    _wg_host_generate_config
     _wg_host_tunnel_create
     _wg_host_tunnel_configure
 }
@@ -137,25 +136,6 @@ function _wg_host_prepare {
     fi
 }
 
-function _wg_host_generate_config {
-    # Wireguard configuration for the macOS host.
-    log Creating a WireGuard host config
-    if [[ -e "$CONFIG_DIR"/wg-host.conf ]]; then
-        success WireGuard host config already exists.
-    else
-        cat > "$CONFIG_DIR"/wg-host.conf <<EOF
-[Interface]
-PrivateKey = $(cat "$CONFIG_DIR"/host.key)
-ListenPort = $wg_listen_port
-
-[Peer]
-PublicKey = $(cat "$CONFIG_DIR"/moby.pub)
-AllowedIPs = $wg_network, $dkr_network, 0.0.0.0/0
-PersistentKeepalive = 25
-EOF
-    fi
-}
-
 function _wg_host_tunnel_create {
     if [[ -z "$wg_iface" ]] || ! ifconfig $wg_iface >/dev/null 2>&1; then
         # no interface
@@ -170,13 +150,21 @@ function _wg_host_tunnel_create {
 }
 
 function _wg_host_tunnel_configure {
-    log Starting WireGuard interface
-    if [[ $(ifconfig $wg_iface | grep -c -F -e UP -e "inet $wg_host") == "2" ]]; then
-      success WireGuard host interface $(value $wg_iface) is already configured.
-    else
-      log Configuring $(value $wg_iface) interface
-      run sudo wg setconf $wg_iface "$CONFIG_DIR"/wg-host.conf
-      run sudo ifconfig $wg_iface $wg_host $wg_moby up
+    log Configuring Wireguard tunnel.
+
+    run sudo wg set $wg_iface \
+        listen-port $wg_listen_port \
+        private-key "$CONFIG_DIR"/host.key \
+        peer "$(<"$CONFIG_DIR"/moby.pub)" \
+            allowed-ips $wg_network \
+            persistent-keepalive 25
+    run sudo ifconfig $wg_iface $wg_host $wg_moby up
+}
+
+function _wg_host_update_allowed_ips {
+    if [ $# -gt 0 ]; then
+        printf -v hosts '%s,' "$@"
+        run sudo wg set $wg_iface peer "$(<"$CONFIG_DIR"/moby.pub)" allowed-ips "${hosts%,}"
     fi
 }
 
@@ -396,6 +384,7 @@ function routes_host_configure {
     done
 
     _routes=("${new_routes[@]}")
+    _wg_host_update_allowed_ips "${_routes[@]}"
 }
 
 function hosts_host_configure {
